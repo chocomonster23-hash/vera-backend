@@ -447,6 +447,220 @@ async def list_promo_codes(admin_email: str):
     
     codes = db.reference('promo_codes').get()
     return codes or {}
+# ============ ADMIN - POP-UP NOTIFICATIONS ============
+
+@app.post("/api/admin/pop-ups/create")
+async def create_pop_up(admin_email: str, pop_up: dict):
+    """Create new pop-up campaign targeting specific user groups"""
+    
+    if admin_email.lower() != DEVELOPER_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    pop_up_id = pop_up.get('title').lower().replace(' ', '_') + '_' + datetime.now().strftime('%Y%m%d%H%M%S')
+    
+    pop_up_data = {
+        'id': pop_up_id,
+        'title': pop_up.get('title'),
+        'text': pop_up.get('text'),
+        'button_1': pop_up.get('button_1'),
+        'button_2': pop_up.get('button_2'),
+        'target_groups': pop_up.get('target_groups', []),
+        'start_date': pop_up.get('start_date'),
+        'end_date': pop_up.get('end_date'),
+        'linked_promo_code': pop_up.get('linked_promo_code'),
+        'status': 'active',
+        'created_at': datetime.now().isoformat(),
+        'impressions': 0,
+        'clicks': 0,
+        'revenue': 0,
+        'target_count': 0
+    }
+    
+    db.reference(f'pop_ups/{pop_up_id}').set(pop_up_data)
+    
+    return {
+        "pop_up_id": pop_up_id,
+        "message": "Campaign created",
+        "target_groups": pop_up.get('target_groups')
+    }
+
+@app.get("/api/pop-ups")
+async def get_active_pop_ups(user_email: str):
+    """Get active pop-ups for user based on their group"""
+    
+    try:
+        user = get_user(user_email)
+        user_groups = determine_user_groups(user)
+        
+        now = datetime.now()
+        pop_ups = db.reference('pop_ups').get()
+        
+        active_pop_ups = []
+        
+        if pop_ups:
+            for pop_up_id, pop_up_data in pop_ups.items():
+                if pop_up_data.get('status') == 'active':
+                    start = datetime.fromisoformat(pop_up_data['start_date'])
+                    end = datetime.fromisoformat(pop_up_data['end_date'])
+                    
+                    if start <= now <= end:
+                        # Проверяем совпадает ли группа юзера с целевыми группами
+                        target_groups = pop_up_data.get('target_groups', [])
+                        
+                        if any(group in target_groups for group in user_groups):
+                            active_pop_ups.append({
+                                'id': pop_up_data['id'],
+                                'title': pop_up_data['title'],
+                                'text': pop_up_data['text'],
+                                'button_1': pop_up_data['button_1'],
+                                'button_2': pop_up_data['button_2'],
+                                'linked_promo_code': pop_up_data.get('linked_promo_code')
+                            })
+        
+        return {"pop_ups": active_pop_ups}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/pop-ups/click")
+async def track_pop_up_click(user_email: str, pop_up_id: str, button_clicked: str, promo_code_applied: Optional[str] = None):
+    """Track when user clicks pop-up button"""
+    
+    try:
+        # Сохраняем что юзер нажимал
+        interaction_data = {
+            'clicked_at': datetime.now().isoformat(),
+            'button': button_clicked
+        }
+        
+        if promo_code_applied:
+            interaction_data['promo_code_applied'] = promo_code_applied
+        
+        db.reference(f'pop_up_interactions/{user_email}/{pop_up_id}').set(interaction_data)
+        
+        # Увеличиваем счётчик clicks
+        pop_up_ref = db.reference(f'pop_ups/{pop_up_id}')
+        pop_up_data = pop_up_ref.get()
+        
+        if pop_up_data:
+            new_clicks = (pop_up_data.get('clicks', 0) or 0) + 1
+            pop_up_ref.update({'clicks': new_clicks})
+        
+        return {"status": "tracked", "pop_up_id": pop_up_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/pop-ups/impression")
+async def track_pop_up_impression(user_email: str, pop_up_id: str):
+    """Track when pop-up is shown to user"""
+    
+    try:
+        # Сохраняем что юзер видел pop-up
+        db.reference(f'pop_up_interactions/{user_email}/{pop_up_id}').set({
+            'viewed_at': datetime.now().isoformat()
+        }, merge=True)
+        
+        # Увеличиваем счётчик impressions
+        pop_up_ref = db.reference(f'pop_ups/{pop_up_id}')
+        pop_up_data = pop_up_ref.get()
+        
+        if pop_up_data:
+            new_impressions = (pop_up_data.get('impressions', 0) or 0) + 1
+            pop_up_ref.update({'impressions': new_impressions})
+        
+        return {"status": "tracked"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/admin/pop-ups/stats")
+async def get_pop_up_stats(admin_email: str):
+    """Get statistics for all pop-up campaigns"""
+    
+    if admin_email.lower() != DEVELOPER_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    pop_ups = db.reference('pop_ups').get()
+    
+    stats = []
+    if pop_ups:
+        for pop_up_id, pop_up_data in pop_ups.items():
+            impressions = pop_up_data.get('impressions', 0) or 0
+            clicks = pop_up_data.get('clicks', 0) or 0
+            ctr = round((clicks / impressions * 100), 1) if impressions > 0 else 0
+            
+            stats.append({
+                'id': pop_up_id,
+                'title': pop_up_data['title'],
+                'status': pop_up_data['status'],
+                'target_groups': pop_up_data.get('target_groups', []),
+                'impressions': impressions,
+                'clicks': clicks,
+                'ctr': f"{ctr}%",
+                'revenue': pop_up_data.get('revenue', 0),
+                'start_date': pop_up_data['start_date'],
+                'end_date': pop_up_data['end_date'],
+                'linked_promo': pop_up_data.get('linked_promo_code')
+            })
+    
+    return {"pop_ups": stats}
+
+def determine_user_groups(user: Dict) -> list:
+    """Determine which groups user belongs to (can be multiple)"""
+    
+    groups = []
+    now = datetime.now()
+    
+    # Основная группа (одна из них)
+    if user.get('subscription') == 'free':
+        groups.append('free_users')
+    elif user.get('subscription') == 'paid':
+        groups.append('paid_users')
+    
+    # Дополнительные группы
+    if user.get('lifetime_purchased'):
+        groups.append('lifetime_users')
+    
+    if user.get('trial_expires'):
+        trial_end = datetime.fromisoformat(user['trial_expires'])
+        if now < trial_end:
+            groups.append('trial_users')
+        elif (now - trial_end).days >= 0 and (now - trial_end).days <= 30:
+            groups.append('expired_trial')
+    
+    if user.get('subscription_expires'):
+        sub_end = datetime.fromisoformat(user['subscription_expires'])
+        if now > sub_end and (now - sub_end).days <= 90:
+            groups.append('expired_subscription')
+    
+    if user.get('last_login'):
+        last_login = datetime.fromisoformat(user['last_login'])
+        if (now - last_login).days > 30:
+            groups.append('inactive_users')
+    
+    groups.append('all_users')
+    
+    return groups
+
+@app.post("/api/admin/pop-ups/{pop_up_id}/pause")
+async def pause_campaign(admin_email: str, pop_up_id: str):
+    """Pause a running campaign"""
+    
+    if admin_email.lower() != DEVELOPER_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    db.reference(f'pop_ups/{pop_up_id}').update({'status': 'paused'})
+    
+    return {"status": "paused", "pop_up_id": pop_up_id}
+
+@app.post("/api/admin/pop-ups/{pop_up_id}/end")
+async def end_campaign(admin_email: str, pop_up_id: str):
+    """End a campaign permanently"""
+    
+    if admin_email.lower() != DEVELOPER_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    db.reference(f'pop_ups/{pop_up_id}').update({'status': 'ended'})
+    
+    return {"status": "ended", "pop_up_id": pop_up_id}
 
 # ============ HEALTH CHECK ============
 
